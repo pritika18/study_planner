@@ -275,6 +275,20 @@ hr {
 }
 
 /* =========================
+   IMPORTANT QUESTION CARDS
+   ========================= */
+
+[class*="st-key-iq_card_"] {
+    background-color: #FFFDF5;
+    border: 1px solid #E1D4EC;
+    border-left: 5px solid #7B5CB8;
+    border-radius: 14px;
+    padding: 16px 20px;
+    margin-bottom: 14px;
+    box-shadow: 0 4px 12px rgba(75, 46, 109, 0.08);
+}
+
+/* =========================
    CUSTOM TITLE
    ========================= */
 
@@ -345,7 +359,8 @@ def inject_css():
         background-color: #FFF8E7 !important;
 }
     [data-testid="stSidebar"] {
-        background-color: #ffffff !important;
+        background-color: #EDE4F7 !important;
+        border-right: 2px solid #D8C8EA;
     }
 
     .block-container {
@@ -991,6 +1006,90 @@ def inject_css():
         color: #8888a6;
         font-size: 11px;
         margin-top: 5px;
+    }
+
+    /* ========================================================
+       LAYOUT FIX  (all pages)
+       - titles were hidden under Streamlit's fixed top bar
+       - last chat message / buttons were hidden behind the chat bar
+       - chat bar had a white strip that did not match the theme
+       ======================================================== */
+
+    [data-testid="stHeader"] {
+        background: #FFF8E7 !important;
+        height: 3rem !important;
+    }
+
+    [data-testid="stMainBlockContainer"],
+    .block-container,
+    .main .block-container {
+        padding: 4.2rem 2rem 8rem 2rem !important;
+        max-width: 1200px !important;
+        margin-left: auto !important;
+        margin-right: auto !important;
+        box-sizing: border-box !important;
+    }
+
+    .page-title {
+        font-size: 28px !important;
+        line-height: 1.35 !important;
+        margin: 0 0 4px 0 !important;
+        overflow: visible !important;
+    }
+
+    .page-subtitle {
+        font-size: 14px !important;
+        line-height: 1.5 !important;
+        margin-bottom: 20px !important;
+    }
+
+    h1, h2, h3 {
+        line-height: 1.3 !important;
+        overflow-wrap: anywhere;
+    }
+
+    /* Bottom chat bar: same cream colour as the page */
+    [data-testid="stBottom"],
+    [data-testid="stBottom"] > div,
+    [data-testid="stBottomBlockContainer"] {
+        background: #FFF8E7 !important;
+    }
+
+    [data-testid="stChatInput"] {
+        background: #FFFDF5 !important;
+        border: 1.5px solid #C9B4DD !important;
+        border-radius: 14px !important;
+    }
+
+    [data-testid="stChatInput"] textarea {
+        background: transparent !important;
+        color: #4B2E6D !important;
+    }
+
+    /* Chat bubbles */
+    .chat-user, .chat-bot {
+        overflow-wrap: anywhere;
+        word-break: break-word;
+        line-height: 1.55;
+    }
+
+    .chat-bot {
+        background: #FFFDF5;
+    }
+
+    iframe {
+        max-width: 100%;
+        border: 0;
+    }
+
+    @media (max-width: 640px) {
+        [data-testid="stMainBlockContainer"],
+        .block-container,
+        .main .block-container {
+            padding: 4rem 1rem 8rem 1rem !important;
+        }
+        .page-title { font-size: 23px !important; }
+        .chat-user, .chat-bot { max-width: 94% !important; }
     }
 
     /* ========================================================
@@ -2335,8 +2434,195 @@ def answer_from_pdf(question,text):
     if not scored: return "I couldn't find a matching answer in the uploaded PDF. Try an exact topic or keyword from the PDF."
     scored.sort(key=lambda z:z[0],reverse=True); return "\n\n".join(x[1] for x in scored[:4])
 
-def speak_text(text):
-    safe=html_lib.escape(text).replace("\n"," "); html("<script>if('speechSynthesis' in window){speechSynthesis.cancel();speechSynthesis.speak(new SpeechSynthesisUtterance("+repr(safe)+"));}</script>")
+def render_js(page_html, height=60):
+    """Render a small HTML+JavaScript widget in an iframe.
+
+    st.html() removes <script> tags, so voice code can never run inside it.
+    An iframe runs JavaScript and is allowed to use the microphone.
+    """
+    if hasattr(st, "iframe"):
+        st.iframe(page_html, height=height)
+    else:
+        import streamlit.components.v1 as components
+        components.html(page_html, height=height)
+
+
+def clean_for_speech(text):
+    """Remove markdown symbols and emojis so the answer is read naturally."""
+    text = re.sub(r"[*_`#>~|]", " ", str(text or ""))
+    text = re.sub(r"[^\w\s.,;:!?()'\"%/+=\-]", " ", text)  # emojis / symbols
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:4000]
+
+
+_SPEAK_JS = r"""
+const TEXT = __TEXT__;
+const AUTOPLAY = __AUTOPLAY__;
+const msg = document.getElementById('msg');
+
+function getSynth() {
+  try {
+    if (window.parent && window.parent.speechSynthesis) {
+      return {s: window.parent.speechSynthesis, U: window.parent.SpeechSynthesisUtterance};
+    }
+  } catch (e) {}
+  return {s: window.speechSynthesis, U: window.SpeechSynthesisUtterance};
+}
+
+function chunks(t) {
+  // Chrome stops long utterances after ~15 seconds, so read sentence by sentence.
+  const parts = t.match(/[^.!?]+[.!?]*/g) || [t];
+  const out = []; let cur = '';
+  parts.forEach(p => {
+    if ((cur + p).length > 180 && cur) { out.push(cur.trim()); cur = p; } else { cur += p; }
+  });
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+
+function speak(auto) {
+  const {s, U} = getSynth();
+  if (!s || !U) { msg.textContent = 'Read aloud is not supported in this browser.'; return; }
+  if (!TEXT) { msg.textContent = 'Nothing to read.'; return; }
+  s.cancel();
+  const list = chunks(TEXT);
+  msg.textContent = '';
+  list.forEach((piece, i) => {
+    const u = new U(piece);
+    u.lang = 'en-IN';
+    u.rate = 1;
+    const voices = s.getVoices();
+    const v = voices.find(x => x.lang === 'en-IN') || voices.find(x => (x.lang || '').startsWith('en'));
+    if (v) u.voice = v;
+    if (i === 0) {
+      u.onstart = () => { msg.textContent = '🔊 Reading...'; };
+      u.onerror = (e) => {
+        if (e.error === 'not-allowed' && auto) msg.textContent = 'Click 🔊 to hear the answer.';
+        else if (e.error !== 'interrupted' && e.error !== 'canceled') msg.textContent = 'Speech error: ' + e.error;
+      };
+    }
+    if (i === list.length - 1) u.onend = () => { msg.textContent = ''; };
+    s.speak(u);
+  });
+}
+
+document.getElementById('play').onclick = () => speak(false);
+document.getElementById('stop').onclick = () => { getSynth().s.cancel(); msg.textContent = ''; };
+if (AUTOPLAY) { setTimeout(() => speak(true), 250); }
+"""
+
+_SPEAK_HTML = """
+<style>
+  body{margin:0;font-family:Inter,Arial,sans-serif;font-size:13px;color:#4B2E6D;background:transparent}
+  button{background:#7B5CB8;color:#fff;border:0;border-radius:8px;padding:6px 12px;font-weight:600;cursor:pointer;margin-right:6px}
+  button:hover{background:#4B2E6D}
+  #stop{background:#EDE4F7;color:#4B2E6D}
+</style>
+<button id="play">🔊 Read Answer Aloud</button><button id="stop">⏹ Stop</button><span id="msg"></span>
+<script>__JS__</script>
+"""
+
+
+def read_aloud_widget(text, autoplay=False):
+    """A 'Read Answer Aloud' button. The click happens inside the iframe, so the
+    browser always allows the speech. autoplay=True also reads it immediately."""
+    spoken = clean_for_speech(text)
+    js = (_SPEAK_JS
+          .replace("__TEXT__", json.dumps(spoken).replace("</", "<\\/"))
+          .replace("__AUTOPLAY__", "true" if autoplay else "false"))
+    render_js(_SPEAK_HTML.replace("__JS__", js), height=44)
+
+
+_VOICE_HTML = """
+<style>
+  body{margin:0;font-family:Inter,Arial,sans-serif;font-size:13px;color:#4B2E6D;background:transparent}
+  #mic{background:#7B5CB8;color:#fff;border:0;border-radius:10px;padding:9px 16px;font-weight:700;cursor:pointer;font-size:14px}
+  #mic:hover{background:#4B2E6D}
+  #mic.on{background:#d64545}
+  #box{margin-top:8px;padding:10px 12px;background:#FFFDF5;border:1px solid #E1D4EC;border-radius:10px;min-height:20px}
+</style>
+<button id="mic">🎤 Ask by Voice</button><span id="st" style="margin-left:8px"></span>
+<div id="box">Press the mic, speak your question, and it is sent to the bot automatically.</div>
+<script>
+const mic = document.getElementById('mic'), st = document.getElementById('st'), box = document.getElementById('box');
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+function findInput(doc) {
+  return doc.querySelector('[data-testid="stChatInputTextArea"]')
+      || doc.querySelector('[data-testid="stChatInput"] textarea')
+      || doc.querySelector('textarea[placeholder^="Ask a question"]');
+}
+
+// Put the spoken text into the chat box of the page and press Send.
+function sendToBot(text) {
+  let doc, win;
+  try { win = window.parent; doc = win.document; } catch (e) { doc = null; }
+  const ta = doc ? findInput(doc) : null;
+  if (!ta) { st.textContent = ' Could not find the chat box. Type your question instead.'; return false; }
+  const setter = Object.getOwnPropertyDescriptor(win.HTMLTextAreaElement.prototype, 'value').set;
+  // The leading mic emoji tells the app this was a voice question (so it reads the answer aloud).
+  setter.call(ta, '🎤 ' + text);
+  ta.dispatchEvent(new win.Event('input', {bubbles: true}));
+  let tries = 0;
+  const timer = setInterval(() => {
+    tries++;
+    const btn = doc.querySelector('[data-testid="stChatInputSubmitButton"]')
+             || doc.querySelector('[data-testid="stChatInput"] button');
+    if (btn && !btn.disabled) { clearInterval(timer); btn.click(); st.textContent = ' Sent ✔'; }
+    else if (tries > 20) {
+      clearInterval(timer);
+      ta.dispatchEvent(new win.KeyboardEvent('keydown', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true}));
+    }
+  }, 100);
+  return true;
+}
+
+if (!SR) {
+  mic.disabled = true;
+  st.textContent = ' Voice input needs Google Chrome or Microsoft Edge.';
+} else {
+  const rec = new SR();
+  rec.lang = 'en-IN';
+  rec.interimResults = true;
+  rec.continuous = false;
+  let listening = false, finalText = '';
+
+  rec.onstart = () => { listening = true; finalText = ''; mic.classList.add('on'); mic.textContent = '⏹ Stop'; st.textContent = ' Listening...'; };
+  rec.onresult = (e) => {
+    let interim = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const t = e.results[i][0].transcript;
+      if (e.results[i].isFinal) finalText += t; else interim += t;
+    }
+    box.textContent = (finalText + ' ' + interim).trim() || '...';
+  };
+  rec.onerror = (e) => {
+    const map = {
+      'not-allowed': ' Microphone blocked. Click the lock icon in the address bar and allow the microphone.',
+      'service-not-allowed': ' Microphone blocked. Allow it in the browser (needs https or localhost).',
+      'no-speech': ' I did not hear anything. Try again.',
+      'audio-capture': ' No microphone found.',
+      'network': ' Speech service needs an internet connection.'
+    };
+    st.textContent = map[e.error] || (' Error: ' + e.error);
+  };
+  rec.onend = () => {
+    listening = false; mic.classList.remove('on'); mic.textContent = '🎤 Ask by Voice';
+    const q = finalText.trim();
+    if (q) { box.textContent = q; st.textContent = ' Sending...'; sendToBot(q); }
+  };
+  mic.onclick = () => {
+    if (listening) { rec.stop(); return; }
+    try { window.parent.speechSynthesis.cancel(); } catch (e) {}
+    try { rec.start(); } catch (e) {}
+  };
+}
+</script>
+"""
+
+
+def voice_question_widget():
+    render_js(_VOICE_HTML, height=125)
 
 
 def add_completed_study_minutes(minutes, subject="General", topic="Pomodoro Session"):
@@ -2352,7 +2638,7 @@ def add_completed_study_minutes(minutes, subject="General", topic="Pomodoro Sess
         "topic": topic,
         "completed": True
     })
-    st.session_state.completed_days.add(date.today())
+    mark_study_completed(date.today())
 
 
 def generate_smart_schedule(subjects, total_minutes, start_time, session_minutes, break_minutes):
@@ -2597,9 +2883,6 @@ if "subjects" not in st.session_state:
 if "sessions" not in st.session_state:
     st.session_state.sessions = []
 
-if "completed_days" not in st.session_state:
-    st.session_state.completed_days = set()
-
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 init_feature_state()
@@ -2629,6 +2912,54 @@ def save_accounts(accounts):
 
 def password_hash(password):
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+def answer_hash(answer):
+    """Hash a recovery answer (case and extra spaces do not matter)."""
+    return hashlib.sha256(" ".join(str(answer).lower().split()).encode("utf-8")).hexdigest()
+
+RECOVERY_QUESTIONS = [
+    "What is your pet's name?",
+    "What is your favourite teacher's name?",
+    "What is the name of your first school?",
+    "What is your favourite food?",
+    "In which town were you born?",
+]
+
+# ---- Remember the logged-in user so the login page is not shown every time ----
+def _remember_file():
+    return Path(__file__).with_name("study_remembered_user.json")
+
+def remember_login(email):
+    try:
+        _remember_file().write_text(json.dumps({"email": email}), encoding="utf-8")
+    except Exception:
+        pass
+
+def clear_remembered_login():
+    try:
+        f = _remember_file()
+        if f.exists():
+            f.unlink()
+    except Exception:
+        pass
+
+def try_auto_login():
+    """Log the saved user back in after a refresh / reopening the app."""
+    if st.session_state.get("logged_in") or st.session_state.get("_manual_logout"):
+        return
+    try:
+        f = _remember_file()
+        if not f.exists():
+            return
+        email = json.loads(f.read_text(encoding="utf-8")).get("email", "")
+        accounts = load_accounts()
+        if email in accounts:
+            st.session_state.logged_in = True
+            st.session_state.user = accounts[email].get("name", email.split("@")[0])
+        else:
+            clear_remembered_login()
+    except Exception:
+        pass
 
 def login_page():
     """Reference-style torn-paper login page."""
@@ -2753,13 +3084,31 @@ def login_page():
         color: #b1b2b7 !important;
     }
 
-    /* Forgotten password */
-    .paper-forgot {
-        text-align: center;
-        font-family: Georgia, "Times New Roman", serif;
-        font-size: 11px;
-        color: #777983;
-        margin: 9px 0 8px;
+    /* Forgotten password (real button styled like a link) */
+    [class*="st-key-login_paper"] .st-key-forgot_toggle .stButton > button {
+        width: auto !important;
+        min-height: 0 !important;
+        height: auto !important;
+        margin: 2px auto 0 !important;
+        padding: 2px 6px !important;
+        background: transparent !important;
+        border: 0 !important;
+        box-shadow: none !important;
+        color: #6a6c78 !important;
+        font-size: 11px !important;
+        text-decoration: underline !important;
+    }
+
+    [class*="st-key-login_paper"] .stCheckbox {
+        display: flex;
+        justify-content: center;
+        margin-top: 4px;
+    }
+
+    [class*="st-key-login_paper"] .stCheckbox label p {
+        font-family: Georgia, "Times New Roman", serif !important;
+        font-size: 11px !important;
+        color: #6e707b !important;
     }
 
     /* Login button */
@@ -2790,24 +3139,44 @@ def login_page():
         color: #383b47 !important;
     }
 
-    /* Create account stays below the paper */
-    .create-account-wrap {
-        text-align: center;
-        margin-top: 10px;
+    /* Small "new user" link below the paper */
+    .st-key-create_wrap {
+        max-width: 430px;
+        margin: 6px auto 0 auto;
     }
 
-    .create-account-wrap button {
-        font-size: 11px !important;
+    .st-key-create_wrap .stButton {
+        display: flex;
+        justify-content: center;
     }
 
-    /* Registration panel */
-    .register-panel {
-        max-width: 700px;
-        margin: 18px auto;
-        padding: 20px;
-        background: rgba(255,255,255,.90);
+    .st-key-create_wrap .stButton > button {
+        background: transparent !important;
+        border: 0 !important;
+        box-shadow: none !important;
+        color: #565966 !important;
+        font-size: 12px !important;
+        text-decoration: underline !important;
+    }
+
+    /* Registration + password-reset panels (real containers) */
+    .st-key-register_panel,
+    .st-key-forgot_panel {
+        max-width: 620px;
+        width: 100%;
+        margin: 18px auto !important;
+        padding: 22px 26px !important;
+        box-sizing: border-box;
+        background: rgba(255,255,255,.92);
         border-radius: 15px;
         box-shadow: 0 10px 30px rgba(60,65,70,.16);
+    }
+
+    .st-key-register_panel .stButton > button,
+    .st-key-forgot_panel .stButton > button {
+        background: #7B5CB8 !important;
+        color: #ffffff !important;
+        border: 0 !important;
     }
 
     @media (max-width: 600px) {
@@ -2821,8 +3190,16 @@ def login_page():
     </style>
     """)
 
+    accounts_now = load_accounts()
+    has_accounts = bool(accounts_now)
+
     if "show_register" not in st.session_state:
-        st.session_state.show_register = False
+        # First ever visit: go straight to Create Account. After that, never push it.
+        st.session_state.show_register = not has_accounts
+    if "show_forgot" not in st.session_state:
+        st.session_state.show_forgot = False
+    if "forgot_user" not in st.session_state:
+        st.session_state.forgot_user = ""
 
     # Everything below is inside ONE real Streamlit container.
     # This prevents the username/password fields from escaping the paper.
@@ -2832,6 +3209,10 @@ def login_page():
         <div class="paper-wing">🪽</div>
         <div class="paper-login-title">Log In</div>
         """)
+
+        flash = st.session_state.pop("flash_msg", None)
+        if flash:
+            st.success(flash)
 
         login_username = st.text_input(
             "username:",
@@ -2846,7 +3227,14 @@ def login_page():
             placeholder=""
         )
 
-        html('<div class="paper-forgot">forgotten password?</div>')
+        if st.button("forgotten password?", key="forgot_toggle"):
+            st.session_state.show_forgot = not st.session_state.show_forgot
+            st.session_state.forgot_user = ""
+            st.rerun()
+
+        keep_logged_in = st.checkbox(
+            "keep me logged in", value=True, key="paper_login_remember"
+        )
 
         login = st.button("Log In", key="paper_login_button")
 
@@ -2856,75 +3244,155 @@ def login_page():
             accounts = load_accounts()
 
             if not email or not password:
-                st.warning("⚠️ Please enter your email and password.")
+                st.warning("⚠️ Please enter your username and password.")
             elif email not in accounts:
-                st.warning("⚠️ Account not found. Please create an account first.")
+                st.warning("⚠️ Account not found. Check your username.")
             elif accounts[email].get("password") != password_hash(password):
-                st.warning("⚠️ Incorrect email or password. Please create an account if you do not have an account.")
+                st.warning("⚠️ Wrong password. Click 'forgotten password?' to reset it.")
             else:
                 st.session_state.logged_in = True
                 st.session_state.user = accounts[email].get("name", email.split("@")[0])
-                st.success("Login successful!")
+                st.session_state._manual_logout = False
+                if keep_logged_in:
+                    remember_login(email)
                 st.rerun()
 
-    # Optional registration
-    st.markdown('<div class="create-account-wrap">', unsafe_allow_html=True)
-    if st.button("Create account", key="paper_create_account"):
-        st.session_state.show_register = not st.session_state.show_register
-        st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
+    # ------------------------------------------------------------
+    # FORGOTTEN PASSWORD
+    # ------------------------------------------------------------
+    if st.session_state.show_forgot:
+        with st.container(key="forgot_panel"):
+            st.markdown(
+                '<h3 style="text-align:center;color:#555866;font-family:Georgia;">Reset Password</h3>',
+                unsafe_allow_html=True
+            )
+
+            if not st.session_state.forgot_user:
+                fp_user = st.text_input("Your username / email", key="forgot_username_input")
+                if st.button("Continue", key="forgot_continue", use_container_width=True):
+                    fp_email = fp_user.strip().lower()
+                    if not fp_email:
+                        st.warning("⚠️ Please enter your username.")
+                    elif fp_email not in load_accounts():
+                        st.warning("⚠️ Account not found.")
+                    else:
+                        st.session_state.forgot_user = fp_email
+                        st.rerun()
+            else:
+                fp_email = st.session_state.forgot_user
+                acct = load_accounts().get(fp_email, {})
+                has_recovery = bool(acct.get("recovery_answer"))
+
+                if has_recovery:
+                    st.info("🔐 " + acct.get("recovery_question", "Security question"))
+                    fp_answer = st.text_input("Your answer", key="forgot_answer_input")
+                else:
+                    st.info("🔐 This account has no security question yet. "
+                            "Enter the full name you used when creating it.")
+                    fp_answer = st.text_input("Full name on the account", key="forgot_answer_input")
+
+                fp_new = st.text_input("New password", type="password", key="forgot_new_pw")
+                fp_conf = st.text_input("Confirm new password", type="password", key="forgot_conf_pw")
+
+                fc1, fc2 = st.columns(2)
+                with fc1:
+                    do_reset = st.button("Reset password", key="forgot_reset", use_container_width=True)
+                with fc2:
+                    if st.button("Cancel", key="forgot_cancel", use_container_width=True):
+                        st.session_state.show_forgot = False
+                        st.session_state.forgot_user = ""
+                        st.rerun()
+
+                if do_reset:
+                    if has_recovery:
+                        verified = answer_hash(fp_answer) == acct.get("recovery_answer")
+                    else:
+                        verified = (fp_answer.strip().lower() == str(acct.get("name", "")).strip().lower()
+                                    and bool(fp_answer.strip()))
+
+                    if not verified:
+                        st.warning("⚠️ That answer is not correct.")
+                    elif len(fp_new) < 4:
+                        st.warning("⚠️ Password must contain at least 4 characters.")
+                    elif fp_new != fp_conf:
+                        st.warning("⚠️ Passwords do not match.")
+                    else:
+                        accounts = load_accounts()
+                        accounts[fp_email]["password"] = password_hash(fp_new)
+                        save_accounts(accounts)
+                        st.session_state.show_forgot = False
+                        st.session_state.forgot_user = ""
+                        st.session_state.flash_msg = "✅ Password updated. Please log in with your new password."
+                        st.rerun()
+
+    # ------------------------------------------------------------
+    # CREATE ACCOUNT (only shown up-front the very first time)
+    # ------------------------------------------------------------
+    if has_accounts:
+        with st.container(key="create_wrap"):
+            label = "Hide create account" if st.session_state.show_register else "New user? Create account"
+            if st.button(label, key="paper_create_account"):
+                st.session_state.show_register = not st.session_state.show_register
+                st.rerun()
 
     if st.session_state.show_register:
-        st.markdown('<div class="register-panel">', unsafe_allow_html=True)
-        st.markdown(
-            '<h3 style="text-align:center;color:#555866;font-family:Georgia;">Create Account</h3>',
-            unsafe_allow_html=True
-        )
-
-        r1, r2 = st.columns(2)
-        with r1:
-            name = st.text_input("Full Name", key="paper_register_name")
-            email = st.text_input("Email / Username", key="paper_register_email")
-        with r2:
-            password = st.text_input(
-                "Password", type="password", key="paper_register_password"
-            )
-            confirm_password = st.text_input(
-                "Confirm Password",
-                type="password",
-                key="paper_register_confirm"
+        with st.container(key="register_panel"):
+            st.markdown(
+                '<h3 style="text-align:center;color:#555866;font-family:Georgia;">Create Account</h3>',
+                unsafe_allow_html=True
             )
 
-        if st.button(
-            "Create account",
-            key="paper_register_button",
-            use_container_width=True
-        ):
-            email_clean = email.strip().lower()
-            accounts = load_accounts()
+            r1, r2 = st.columns(2)
+            with r1:
+                name = st.text_input("Full Name", key="paper_register_name")
+                password = st.text_input(
+                    "Password", type="password", key="paper_register_password"
+                )
+                rec_question = st.selectbox(
+                    "Security question (for forgotten password)",
+                    RECOVERY_QUESTIONS,
+                    key="paper_register_question"
+                )
+            with r2:
+                email = st.text_input("Email / Username", key="paper_register_email")
+                confirm_password = st.text_input(
+                    "Confirm Password",
+                    type="password",
+                    key="paper_register_confirm"
+                )
+                rec_answer = st.text_input("Your answer", key="paper_register_answer")
 
-            if not all([name.strip(), email_clean, password, confirm_password]):
-                st.warning("⚠️ Please fill all fields.")
-            elif "@" not in email_clean or "." not in email_clean.split("@")[-1]:
-                st.warning("⚠️ Please enter a valid email address.")
-            elif password != confirm_password:
-                st.warning("⚠️ Passwords do not match.")
-            elif len(password) < 4:
-                st.warning("⚠️ Password must contain at least 4 characters.")
-            elif email_clean in accounts:
-                st.warning("⚠️ This account already exists. Please log in.")
-            else:
-                accounts[email_clean] = {
-                    "name": name.strip(),
-                    "password": password_hash(password)
-                }
-                save_accounts(accounts)
-                st.session_state.logged_in = True
-                st.session_state.user = name.strip()
-                st.success("Account created successfully!")
-                st.rerun()
+            if st.button(
+                "Create account",
+                key="paper_register_button",
+                use_container_width=True
+            ):
+                email_clean = email.strip().lower()
+                accounts = load_accounts()
 
-        st.markdown("</div>", unsafe_allow_html=True)
+                if not all([name.strip(), email_clean, password, confirm_password, rec_answer.strip()]):
+                    st.warning("⚠️ Please fill all fields.")
+                elif "@" not in email_clean or "." not in email_clean.split("@")[-1]:
+                    st.warning("⚠️ Please enter a valid email address.")
+                elif password != confirm_password:
+                    st.warning("⚠️ Passwords do not match.")
+                elif len(password) < 4:
+                    st.warning("⚠️ Password must contain at least 4 characters.")
+                elif email_clean in accounts:
+                    st.warning("⚠️ This account already exists. Please log in.")
+                else:
+                    accounts[email_clean] = {
+                        "name": name.strip(),
+                        "password": password_hash(password),
+                        "recovery_question": rec_question,
+                        "recovery_answer": answer_hash(rec_answer)
+                    }
+                    save_accounts(accounts)
+                    st.session_state.logged_in = True
+                    st.session_state.user = name.strip()
+                    st.session_state._manual_logout = False
+                    remember_login(email_clean)
+                    st.rerun()
 
 
 # ============================================================
@@ -2937,21 +3405,89 @@ def login_page():
 # 🤖 Study Chatbot
 # ============================================================
 
+# ============================================================
+# STUDY STREAK DATA
+# ============================================================
+
+STREAK_FILE = "study_streak.json"
+
+
+def load_streak_data():
+    """Load saved study dates."""
+    try:
+        if os.path.exists(STREAK_FILE):
+            with open(STREAK_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            completed_days = set()
+
+            for day in data.get("completed_days", []):
+                try:
+                    completed_days.add(date.fromisoformat(day))
+                except (ValueError, TypeError):
+                    continue
+
+            return completed_days
+
+    except Exception:
+        pass
+
+    return set()
+
+
+def save_streak_data():
+    """Save study dates permanently."""
+    try:
+        data = {
+            "completed_days": [
+                day.isoformat()
+                for day in sorted(st.session_state.completed_days)
+            ]
+        }
+
+        with open(STREAK_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def mark_study_completed(day=None):
+    """Record a study day and save it so the streak survives a refresh."""
+    day = day or date.today()
+    st.session_state.completed_days.add(day)
+    save_streak_data()
+
+
 def calculate_streak():
-
-    if not st.session_state.completed_days:
-        return 0
-
+    """Number of consecutive study days ending today (or yesterday)."""
+    days = st.session_state.get("completed_days", set())
     current = date.today()
+    if current not in days:
+        current -= timedelta(days=1)
     streak = 0
-
-    while current in st.session_state.completed_days:
+    while current in days:
         streak += 1
         current -= timedelta(days=1)
-
     return streak
 
 
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+if "sessions" not in st.session_state:
+    st.session_state.sessions = []
+
+if "completed_days" not in st.session_state:
+    st.session_state.completed_days = load_streak_data()
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+init_feature_state()
+
+
+# ============================================================
 # ============================================================
 # ADD STUDY SESSION
 # ============================================================
@@ -3048,14 +3584,14 @@ def app_sidebar():
                 <div style="
                     font-size:21px;
                     font-weight:800;
-                    color:white;
+                    color:#4B2E6D;
                 ">
                     Study Planner
                 </div>
 
                 <div style="
                     font-size:11px;
-                    color:#b8b5ff;
+                    color:#7B5CB8;
                 ">
                     Smart Study Planner
                 </div>
@@ -3089,6 +3625,9 @@ def app_sidebar():
 
             st.session_state.logged_in = False
             st.session_state.user = ""
+            st.session_state._manual_logout = True
+            st.session_state.show_register = False
+            clear_remembered_login()
 
             st.rerun()
 
@@ -3258,28 +3797,17 @@ def study_planner():
                     </div>
                     """)
 
-                if not session["completed"]:
-
+                if not session.get("completed", False):
                     if st.button(
-                        f"✅ Complete — {session['subject']}",
+                        "✅ Mark Completed",
                         key=f"dashboard_complete_{index}"
                     ):
-
-                        st.session_state.sessions[
-                            index
-                        ]["completed"] = True
-
-                        st.session_state.completed_days.add(
-                            today
-                        )
-
+                        st.session_state.sessions[index]["completed"] = True
+                        mark_study_completed(today)
                         st.rerun()
 
         else:
-
-            st.info(
-                "🎉 No study sessions scheduled for today."
-            )
+            st.info("📭 No study sessions planned for today.")
 
         # ----------------------------------------------------
         # ADD SESSION
@@ -3374,9 +3902,7 @@ def study_planner():
                             index
                         ]["completed"] = True
 
-                        st.session_state.completed_days.add(
-                            selected_date
-                        )
+                        mark_study_completed(selected_date)
 
                         st.rerun()
 
@@ -3677,22 +4203,35 @@ def study_planner():
         else: st.info("Upload a text-based PDF to use PDF study features.")
         st.session_state.ai_mode=st.selectbox("🧠 AI Study Mode",["Explain","Summarize","Quiz Me","Important Questions","Revision"],key="ai_mode_select")
         st.markdown("### 🎤 Voice Questions")
-        st.caption("Use your browser microphone. Copy the recognized text into the chat box.")
-        st.iframe("""<button id='m'>🎤 Start Voice</button><span id='s'></span><div id='r' style='margin-top:8px;padding:10px;background:#f7f5ff;border-radius:10px'>Your speech appears here.</div><script>const b=document.getElementById('m'),r=document.getElementById('r'),s=document.getElementById('s'),SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR){b.disabled=true;s.textContent=' Not supported'}else{const x=new SR();x.lang='en-IN';x.onstart=()=>s.textContent=' Listening...';x.onresult=e=>{r.textContent=e.results[0][0].transcript;s.textContent=' Done'};x.onerror=e=>s.textContent=' '+e.error;b.onclick=()=>x.start()}</script>""",height=100)
+        st.caption("Press the mic and speak. Your question is sent to the bot automatically and the answer is read aloud.")
+        voice_question_widget()
+
         for i,m in enumerate(st.session_state.chat_history):
-            if m["role"]=="user": html(f'<div class="chat-user">👤 {html_lib.escape(m["text"])}</div>')
+            if m["role"]=="user":
+                icon = "🎤" if m.get("voice") else "👤"
+                html(f'<div class="chat-user" style="white-space:pre-wrap">{icon} {html_lib.escape(m["text"])}</div>')
             else:
-                html(f'<div class="chat-bot">🤖 {html_lib.escape(m["text"])}</div>')
-                if st.button("🔊 Read Answer Aloud",key=f"speak_{i}"): speak_text(m["text"])
+                html(f'<div class="chat-bot" style="white-space:pre-wrap">🤖 {html_lib.escape(m["text"])}</div>')
+                # Voice questions are answered out loud automatically (only once).
+                auto = bool(m.get("autospeak")) and not m.get("spoken")
+                if auto:
+                    m["spoken"] = True
+                read_aloud_widget(m["text"], autoplay=auto)
+
         question=st.chat_input("Ask a question from your PDF or study planner...")
         if question:
-            st.session_state.chat_history.append({"role":"user","text":question}); mode=st.session_state.ai_mode
+            voice_asked = question.lstrip().startswith("🎤")
+            if voice_asked:
+                question = question.lstrip().lstrip("🎤").strip()
+            if not question:
+                st.stop()
+            st.session_state.chat_history.append({"role":"user","text":question,"voice":voice_asked}); mode=st.session_state.ai_mode
             if mode=="Explain": response=answer_from_pdf(question,st.session_state.pdf_text) if st.session_state.pdf_text else "Upload a PDF first."
             elif mode=="Summarize": response=("📌 **Summary**\n\n"+"\n\n".join(st.session_state.pdf_text.split("\n")[:10])) if st.session_state.pdf_text else "Upload a PDF first."
             elif mode=="Quiz Me": response=("🧠 **Quick Quiz**\n\n"+"\n".join(f"{i+1}. {item['question']}" for i,item in enumerate(generate_important_questions(st.session_state.pdf_text,5)))) if st.session_state.pdf_text else "Upload a PDF first."
             elif mode=="Important Questions": response="⭐ Open Important Questions from the sidebar."
             else: response=("🔄 **Revision Mode**\n\n"+answer_from_pdf(question,st.session_state.pdf_text)) if st.session_state.pdf_text else "Upload a PDF first."
-            st.session_state.chat_history.append({"role":"bot","text":response}); award("First Question","💬","Asked your first study question")
+            st.session_state.chat_history.append({"role":"bot","text":response,"autospeak":voice_asked,"spoken":False}); award("First Question","💬","Asked your first study question")
             if sum(1 for m in st.session_state.chat_history if m["role"]=="user")>=10: award("10 Questions","🎯","Asked 10 study questions")
             st.rerun()
 
@@ -3902,25 +4441,20 @@ def study_planner():
                            "Important Questions needs definitions ('X is ...'), a question list, "
                            "or question-and-answer text in the PDF.")
             else:
+                first_no = st.session_state.get("important_offset", 0)
                 for i, item in enumerate(questions, start=1):
-                    st.markdown(f"### ⭐ {i}. {_md_safe(item.get('question', ''))}")
-                    st.markdown("**📝 Answer:** " + _md_safe(item.get("answer", "")))
-                    if item.get("section"):
-                        st.caption(f"📍 From section: {item['section']}")
-
-                    if st.button("🔖 Save", key=f"important_save_{i}_{st.session_state.get('important_offset', 0)}"):
-                        if item not in st.session_state.saved_important:
-                            st.session_state.saved_important.append(item)
-                        award("Important Question", "⭐", "Saved an important revision question")
-                        st.success("Question saved!")
-
-                    st.divider()
+                    with st.container(key=f"iq_card_{i}"):
+                        st.markdown(f"**⭐ Q{first_no + i}. {_md_safe(item.get('question', ''))}**")
+                        st.markdown("**📝 Answer:** " + _md_safe(item.get("answer", "")))
+                        if item.get("section"):
+                            st.caption(f"📍 From section: {item['section']}")
 
 
 # ============================================================
 # RUN STUDY PLANNER AFTER LOGIN
 # ============================================================
 inject_css()
+try_auto_login()
 
 if st.session_state.logged_in:
 
