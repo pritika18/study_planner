@@ -3328,9 +3328,6 @@ if "user" not in st.session_state:
 
 if "subjects" not in st.session_state:
     st.session_state.subjects = [
-        "Organic Chemistry",
-        "US History",
-        "Python"
     ]
 
 if "sessions" not in st.session_state:
@@ -3443,7 +3440,7 @@ def reset_session_for_new_user(email, name):
     st.session_state.user_email = email
     st.session_state._manual_logout = False
 
-    st.session_state.subjects = ["Organic Chemistry", "US History", "Python"]
+    st.session_state.subjects = []
     st.session_state.sessions = []
     st.session_state.chat_history = []
     st.session_state.completed_days = load_streak_data()
