@@ -12,11 +12,18 @@ from pathlib import Path
 
 import os
 
-PDF_CACHE_FILE = "study_pdf_cache.json"
+def _safe_user_slug():
+    """A filename-safe id for the logged-in user, so each user gets their own files."""
+    email = st.session_state.get("user_email") or "guest"
+    return re.sub(r"[^a-zA-Z0-9]+", "_", email).strip("_") or "guest"
+
+
+def _pdf_cache_file():
+    return f"study_pdf_cache__{_safe_user_slug()}.json"
 
 
 def save_pdf_cache(text, filename, pages=None):
-    """Save the uploaded PDF text so it can be reused across pages/sessions."""
+    """Save the uploaded PDF text so it can be reused across pages for THIS user only."""
     try:
         data = {
             "text": text,
@@ -24,7 +31,7 @@ def save_pdf_cache(text, filename, pages=None):
             "pages": pages or []
         }
 
-        with open(PDF_CACHE_FILE, "w", encoding="utf-8") as f:
+        with open(_pdf_cache_file(), "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
 
         return True
@@ -33,13 +40,14 @@ def save_pdf_cache(text, filename, pages=None):
 
 
 def load_pdf_cache():
-    """Load the last uploaded PDF for Important Questions, Quiz and Chatbot."""
+    """Load the last PDF THIS user uploaded, for Important Questions, Quiz and Chatbot."""
     try:
-        if not os.path.exists(PDF_CACHE_FILE):
+        f = _pdf_cache_file()
+        if not os.path.exists(f):
             return None
 
-        with open(PDF_CACHE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        with open(f, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
 
         if not data.get("text"):
             return None
@@ -1082,6 +1090,18 @@ def inject_css():
         border: 0;
     }
 
+    .topic-row {
+        background: #FFFDF5;
+        border: 1px solid #E1D4EC;
+        border-radius: 12px;
+        padding: 10px 14px;
+        margin-bottom: 8px;
+    }
+    .topic-name { font-weight: 700; color: #4B2E6D; font-size: 14px; overflow-wrap: anywhere; }
+    .topic-bar { height: 9px; background: #EDE4F7; border-radius: 6px; margin: 7px 0 5px; overflow: hidden; }
+    .topic-bar > div { height: 100%; border-radius: 6px; }
+    .topic-pct { font-size: 12px; color: #6E5487; }
+
     @media (max-width: 640px) {
         [data-testid="stMainBlockContainer"],
         .block-container,
@@ -1124,6 +1144,7 @@ def init_feature_state():
         "achievements":[],"notes":[],"important_questions":[],"saved_important":[],"ai_mode":"Explain",
         "pomodoro_count":0,"pomodoro_minutes":0,"study_goals":[],"mistake_review":[],
         "smart_schedule":[],"daily_goal_minutes":120,"goal_date":date.today(),
+    "viva_pool":[],"viva_idx":0,
         "last_pdf_quiz_name":"",
         "quiz_id":0,"pdf_sig":"","quiz_source":"","important_source":"","important_offset":0
     }
@@ -2758,6 +2779,437 @@ def render_daily_goals():
         st.info(f"{goal - today_minutes} minutes remaining today.")
 
 
+# ============================================================
+# PER-USER DATA  (topic results + exams) - saved in a file
+# ============================================================
+
+def _userdata_file():
+    return Path(__file__).with_name("study_userdata.json")
+
+
+def _user_key():
+    return st.session_state.get("user_email") or "guest"
+
+
+def _load_userdata():
+    try:
+        f = _userdata_file()
+        if f.exists():
+            data = json.loads(f.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_userdata(data):
+    try:
+        _userdata_file().write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def get_user_value(name, default):
+    return _load_userdata().get(_user_key(), {}).get(name, default)
+
+
+def set_user_value(name, value):
+    data = _load_userdata()
+    data.setdefault(_user_key(), {})[name] = value
+    _save_userdata(data)
+
+
+WEAK_BELOW = 60      # accuracy % below this  -> weak
+STRONG_FROM = 80     # accuracy % from this   -> strong
+HISTORY_KEEP = 10    # only the latest answers per topic count (so improvement shows)
+
+
+def _clean_topic(section):
+    topic = re.sub(r"\s+", " ", str(section or "")).strip()
+    topic = re.sub(r"^(chapter|unit|section|topic|lesson|module|part)\s*\d+\s*[:.\-–—]?\s*", "", topic, flags=re.I)
+    topic = topic.strip(" .:-–—#*0123456789)")
+    return (topic[:60] or "General")
+
+
+def record_quiz_results(quiz, answers, pdf_name=""):
+    """Save every ANSWERED quiz question against its PDF section (= topic)."""
+    stats = get_user_value("topic_stats", {})
+    today = date.today().isoformat()
+    for i, q in enumerate(quiz):
+        chosen = answers.get(i)
+        if not chosen:            # unanswered questions are not counted against you
+            continue
+        topic = _clean_topic(q.get("section"))
+        entry = stats.setdefault(topic, {"hist": [], "pdf": pdf_name, "last": today})
+        entry["hist"] = (entry.get("hist", []) + [1 if chosen == q["answer"] else 0])[-HISTORY_KEEP:]
+        entry["pdf"] = pdf_name or entry.get("pdf", "")
+        entry["last"] = today
+    set_user_value("topic_stats", stats)
+
+
+def record_topic_result(topic, correct, pdf_name=""):
+    """Same bookkeeping as record_quiz_results, for ONE answer at a time
+    (used by Voice Viva, where questions are answered one by one)."""
+    stats = get_user_value("topic_stats", {})
+    topic = _clean_topic(topic)
+    entry = stats.setdefault(topic, {"hist": [], "pdf": pdf_name, "last": ""})
+    entry["hist"] = (entry.get("hist", []) + [1 if correct else 0])[-HISTORY_KEEP:]
+    entry["pdf"] = pdf_name or entry.get("pdf", "")
+    entry["last"] = date.today().isoformat()
+    set_user_value("topic_stats", stats)
+
+
+_VIVA_STOPWORDS = {
+    "what", "is", "are", "the", "a", "an", "of", "in", "on", "to", "for", "and", "or",
+    "that", "this", "it", "its", "by", "with", "as", "be", "which", "used", "use",
+    "does", "do", "can", "you", "explain", "define", "describe", "how", "why",
+}
+
+
+def _viva_keywords(text):
+    return {_sg_stem(w.lower()) for w in _sg_words(text)
+            if len(w) > 2 and w.lower() not in _VIVA_STOPWORDS}
+
+
+def grade_viva_answer(given, correct):
+    """Compare a SPOKEN/typed answer against the expected short answer.
+
+    Free-text answers never match word-for-word, so this checks whether the
+    important words are present (allowing different wording) and, as a
+    backup, how similar the two strings look character by character (which
+    forgives small mistakes speech recognition makes)."""
+    import difflib
+    given_n = re.sub(r"\s+", " ", given or "").strip().lower()
+    correct_n = re.sub(r"\s+", " ", correct or "").strip().lower()
+    if not given_n:
+        return False, 0.0
+    if given_n == correct_n:
+        return True, 1.0
+    ck = _viva_keywords(correct)
+    gk = _viva_keywords(given)
+    overlap = (len(gk & ck) / len(ck)) if ck else 0.0
+    ratio = difflib.SequenceMatcher(None, given_n, correct_n).ratio()
+    score = max(overlap, ratio)
+    return score >= 0.55, round(score, 2)
+
+
+def build_viva_pool(text, n=8):
+    """Pick N question/answer pairs (no options) from the PDF for an oral quiz."""
+    raw = generate_pdf_quiz(text, limit=max(n * 3, 15)) or []
+    random.shuffle(raw)
+    seen, pool = set(), []
+    for q in raw:
+        ques = (q.get("question") or "").strip()
+        ans = (q.get("answer") or "").strip()
+        if not ques or not ans or len(ans.split()) > 22:
+            continue
+        key = ques.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        pool.append({
+            "question": ques, "answer": ans, "section": q.get("section", ""),
+            "given": None, "correct": None, "score": None,
+            "asked_spoken": False, "result_spoken": False,
+        })
+        if len(pool) >= n:
+            break
+    return pool
+
+
+def render_voice_viva():
+    if not st.session_state.get("pdf_text"):
+        ensure_pdf_ready()
+    if not st.session_state.get("pdf_text"):
+        st.info("📭 Upload a study PDF first (from **🧠 PDF Quiz** or **📄 PDF Summary**), "
+                "then come back here for an oral quiz.")
+        return
+
+    pool = st.session_state.get("viva_pool") or []
+    idx = st.session_state.get("viva_idx", 0)
+
+    if not pool:
+        st.caption("The bot asks a question out loud, you answer by voice (or type), and it "
+                   "checks your answer against the PDF.")
+        n = st.slider("Number of questions", 3, 12, 8, key="viva_n")
+        if st.button("🎤 Start Voice Viva", use_container_width=True):
+            built = build_viva_pool(st.session_state.pdf_text, n)
+            if not built:
+                st.warning("I could not build enough questions from this PDF for a viva.")
+            else:
+                st.session_state.viva_pool = built
+                st.session_state.viva_idx = 0
+                st.rerun()
+        return
+
+    # ---------------- FINISHED ----------------
+    if idx >= len(pool):
+        correct_n = sum(1 for q in pool if q["correct"])
+        pct = round(correct_n / len(pool) * 100)
+        st.markdown(f"### 🏁 Viva complete — {correct_n} of {len(pool)} correct ({pct}%)")
+        st.progress(pct / 100)
+        for i, q in enumerate(pool, 1):
+            icon = "✅" if q["correct"] else "❌"
+            with st.expander(f"{icon} Q{i}. {q['question']}"):
+                st.write(f"**Your answer:** {q['given'] or 'No answer'}")
+                st.write(f"**Correct answer:** {q['answer']}")
+        award("Voice Viva", "🎤", "Completed a spoken oral quiz")
+        if st.button("🔁 Start a new viva", use_container_width=True):
+            st.session_state.viva_pool = []
+            st.session_state.viva_idx = 0
+            st.rerun()
+        return
+
+    # ---------------- IN PROGRESS ----------------
+    q = pool[idx]
+    correct_so_far = sum(1 for x in pool[:idx] if x["correct"])
+    st.progress(idx / len(pool))
+    st.caption(f"Question {idx + 1} of {len(pool)} · Score so far: {correct_so_far}/{idx}")
+
+    html(f'<div class="chat-bot" style="white-space:pre-wrap">🤖 {html_lib.escape(q["question"])}</div>')
+    read_aloud_widget(q["question"], autoplay=not q["asked_spoken"])
+    q["asked_spoken"] = True
+
+    if q["given"] is None:
+        st.markdown("##### 🎤 Give your answer")
+        voice_question_widget()
+        answer = st.chat_input("Or type your answer here...")
+        if answer:
+            voice_asked = answer.lstrip().startswith("🎤")
+            if voice_asked:
+                answer = answer.lstrip().lstrip("🎤").strip()
+            correct, score = grade_viva_answer(answer, q["answer"])
+            q["given"] = answer
+            q["correct"] = correct
+            q["score"] = score
+            record_topic_result(q.get("section"), correct, st.session_state.get("pdf_name", ""))
+            if idx == 0:
+                award("First Question", "💬", "Asked your first study question")
+            st.rerun()
+    else:
+        html(f'<div class="chat-user" style="white-space:pre-wrap">👤 {html_lib.escape(q["given"])}</div>')
+        if q["correct"]:
+            st.success(f"✅ Correct! **{q['answer']}**")
+            feedback = f"Correct! {q['answer']}"
+        else:
+            st.error(f"❌ Not quite. The correct answer is: **{q['answer']}**")
+            feedback = f"Not quite. The correct answer is: {q['answer']}"
+        read_aloud_widget(feedback, autoplay=not q["result_spoken"])
+        q["result_spoken"] = True
+
+        label = "🏁 See final score" if idx + 1 >= len(pool) else "➡️ Next question"
+        if st.button(label, use_container_width=True):
+            st.session_state.viva_idx = idx + 1
+            st.rerun()
+
+
+def topic_summary():
+    """One row per topic, weakest first."""
+    rows = []
+    for topic, d in get_user_value("topic_stats", {}).items():
+        hist = d.get("hist", [])
+        if not hist:
+            continue
+        acc = round(sum(hist) / len(hist) * 100)
+        if len(hist) < 2:
+            level = "new"
+        elif acc >= STRONG_FROM:
+            level = "strong"
+        elif acc >= WEAK_BELOW:
+            level = "average"
+        else:
+            level = "weak"
+        rows.append({"topic": topic, "acc": acc, "n": len(hist), "right": sum(hist),
+                     "level": level, "last": d.get("last", ""), "pdf": d.get("pdf", "")})
+    rows.sort(key=lambda r: (r["acc"], r["topic"]))
+    return rows
+
+
+_LEVEL_STYLE = {
+    "weak":    ("🔴 Weak",    "#d64545"),
+    "average": ("🟡 Average", "#e0a21b"),
+    "strong":  ("🟢 Strong",  "#2e9e5b"),
+    "new":     ("⚪ Need more questions", "#9a94ad"),
+}
+
+
+def _topic_bars(rows):
+    for r in rows:
+        color = _LEVEL_STYLE[r["level"]][1]
+        html(f"""
+            <div class="topic-row">
+                <div class="topic-name">{html_lib.escape(r["topic"])}</div>
+                <div class="topic-bar"><div style="width:{max(r["acc"], 3)}%;background:{color}"></div></div>
+                <div class="topic-pct">{r["acc"]}% &nbsp;·&nbsp; {r["right"]} of {r["n"]} correct</div>
+            </div>
+            """)
+
+
+def readiness_score():
+    """0-100 readiness plus the parts it is made of."""
+    rows = topic_summary()
+    answered = sum(r["n"] for r in rows)
+    right = sum(r["right"] for r in rows)
+    quiz_pct = round(right / answered * 100) if answered else 0
+
+    today = date.today()
+    days = st.session_state.get("completed_days", set())
+    study_days = sum(1 for d in days if 0 <= (today - d).days <= 6)
+    consistency_pct = round(study_days / 7 * 100)
+
+    due = [x for x in st.session_state.sessions if x.get("date") and x["date"] <= today]
+    session_pct = round(sum(1 for x in due if x.get("completed")) / len(due) * 100) if due else 0
+
+    score = round(0.60 * quiz_pct + 0.25 * consistency_pct + 0.15 * session_pct)
+    return score, {"quiz": quiz_pct, "consistency": consistency_pct, "sessions": session_pct,
+                   "answered": answered, "study_days": study_days}
+
+
+def render_topic_strength():
+    rows = topic_summary()
+    if not rows:
+        st.info("📭 No topic results yet. Open **🧠 PDF Quiz**, answer the questions and press **Submit Quiz**. "
+                "Your weak and strong topics will appear here.")
+        return
+
+    weak = [r for r in rows if r["level"] == "weak"]
+    avg = [r for r in rows if r["level"] == "average"]
+    strong = [r for r in rows if r["level"] == "strong"]
+    new = [r for r in rows if r["level"] == "new"]
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("🔴 Weak", len(weak))
+    c2.metric("🟡 Average", len(avg))
+    c3.metric("🟢 Strong", len(strong))
+    c4.metric("Questions counted", sum(r["n"] for r in rows))
+    st.caption(f"Weak = below {WEAK_BELOW}%, Strong = {STRONG_FROM}% or more. "
+               f"Only your latest {HISTORY_KEEP} answers per topic count, so improving raises your score.")
+
+    df = pd.DataFrame([{"Topic": r["topic"], "Accuracy %": r["acc"],
+                        "Level": _LEVEL_STYLE[r["level"]][0]} for r in rows])
+    fig = px.bar(df, x="Accuracy %", y="Topic", orientation="h", color="Level", range_x=[0, 100],
+                 color_discrete_map={_LEVEL_STYLE[k][0]: v[1] for k, v in _LEVEL_STYLE.items()})
+    fig.update_layout(height=max(220, 46 * len(df) + 90), margin=dict(l=0, r=10, t=10, b=0),
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                      yaxis=dict(autorange="reversed", title=""), legend_title_text="")
+    st.plotly_chart(fig, use_container_width=True)
+
+    for label, group, note in [
+        ("🔴 Weak topics — revise these first", weak, "Read this part of your PDF again, then retake the quiz."),
+        ("🟡 Average topics — almost there", avg, "A little more practice will make these strong."),
+        ("🟢 Strong topics — well done", strong, "Keep these fresh with a quick revision now and then."),
+        ("⚪ Need more questions", new, "Answer at least 2 questions from a topic to rate it."),
+    ]:
+        if group:
+            st.markdown(f"#### {label}")
+            st.caption(note)
+            _topic_bars(group)
+
+    st.divider()
+    b1, b2 = st.columns(2)
+    with b1:
+        if weak and st.button("🧠 Practice my weak topics", use_container_width=True):
+            ensure_pdf_ready()
+            pool = generate_pdf_quiz(st.session_state.get("pdf_text", ""), limit=60) or []
+            weak_names = {r["topic"] for r in weak}
+            picked = [q for q in pool if _clean_topic(q.get("section")) in weak_names][:10]
+            if picked:
+                st.session_state.pdf_quiz = picked
+                st.session_state.quiz_id = st.session_state.get("quiz_id", 0) + 1
+                st.session_state.quiz_answers = {}
+                st.session_state.quiz_submitted = False
+                st.session_state.quiz_score = 0
+                st.success(f"✅ {len(picked)} questions from your weak topics are ready. Open **🧠 PDF Quiz** from the menu.")
+            else:
+                st.warning("I could not build questions for those topics from the PDF that is loaded now. "
+                           "Upload the same PDF you took the quiz on and try again.")
+    with b2:
+        if st.button("🗑️ Clear topic history", use_container_width=True):
+            set_user_value("topic_stats", {})
+            st.rerun()
+
+
+def render_exam_countdown():
+    exams = get_user_value("exams", [])
+
+    with st.form("exam_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        exam_name = c1.text_input("Exam name", placeholder="Example: Python Final")
+        exam_date = c2.date_input("Exam date", date.today() + timedelta(days=14), min_value=date.today())
+        add = st.form_submit_button("➕ Add exam", use_container_width=True)
+    if add:
+        if not exam_name.strip():
+            st.warning("⚠️ Please enter the exam name.")
+        else:
+            exams.append({"name": exam_name.strip(), "date": exam_date.isoformat()})
+            set_user_value("exams", exams)
+            st.rerun()
+
+    if not exams:
+        st.info("📭 Add your exam above. You will see the days left, your readiness score and a daily study target.")
+        return
+
+    score, parts = readiness_score()
+    if score >= 75:
+        badge, color = "🟢 Ready", "#2e9e5b"
+    elif score >= 40:
+        badge, color = "🟡 Getting there", "#e0a21b"
+    else:
+        badge, color = "🔴 Needs work", "#d64545"
+
+    rows = topic_summary()
+    weak = [r for r in rows if r["level"] == "weak"]
+    strong = [r for r in rows if r["level"] == "strong"]
+
+    order = sorted(range(len(exams)), key=lambda i: exams[i]["date"])
+    for i in order:
+        ex = exams[i]
+        try:
+            days_left = (date.fromisoformat(ex["date"]) - date.today()).days
+        except Exception:
+            continue
+
+        if days_left < 0:
+            when, target = "Exam date has passed", "—"
+        elif days_left == 0:
+            when, target = "Exam is TODAY 🍀", "Revise weak topics only"
+        else:
+            needed = round((100 - score) / 100 * 600)                 # minutes still to study
+            per_day = min(180, max(20, -(-needed // days_left)))
+            target = f"{int(round(per_day / 5) * 5)} min"
+            when = f"{days_left} day{'s' if days_left != 1 else ''} left"
+
+        with st.container(border=True):
+            top, btn = st.columns([6, 1])
+            top.markdown(f"### 🎓 {_md_safe(ex['name'])}")
+            top.caption(f"{date.fromisoformat(ex['date']).strftime('%A, %d %B %Y')}")
+            if btn.button("🗑️", key=f"del_exam_{i}", help="Delete this exam"):
+                exams.pop(i)
+                set_user_value("exams", exams)
+                st.rerun()
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("⏳ Countdown", when)
+            m2.metric("📈 Readiness", f"{score}%")
+            m3.metric("🎯 Study today", target)
+            st.progress(min(score, 100) / 100)
+            st.markdown(f"<span style='color:{color};font-weight:700'>{badge}</span>", unsafe_allow_html=True)
+
+            if weak:
+                st.markdown("**🔴 Revise first:** " + ", ".join(_md_safe(r["topic"]) for r in weak[:3]))
+            if strong:
+                st.markdown("**🟢 Strong in:** " + ", ".join(_md_safe(r["topic"]) for r in strong[-3:][::-1]))
+            if not rows:
+                st.caption("Take a PDF Quiz to find your weak and strong topics.")
+
+    with st.expander("How is my readiness score calculated?"):
+        st.write(f"- **Quiz accuracy — 60%:** {parts['quiz']}% ({parts['answered']} answered questions)")
+        st.write(f"- **Study consistency — 25%:** {parts['study_days']} of the last 7 days = {parts['consistency']}%")
+        st.write(f"- **Planned sessions completed — 15%:** {parts['sessions']}%")
+        st.caption("The daily target spreads about 10 hours of full preparation over the days left, "
+                   "scaled by how far you are from 100%.")
+
+
 def render_mistake_review():
     st.markdown("### 🔁 Mistake Review")
     mistakes = st.session_state.mistake_review
@@ -2861,7 +3313,8 @@ def feature_sidebar_pages():
         "🤖 Study Chatbot","📄 PDF Summary","🧠 PDF Quiz",
         "⏱️ Pomodoro Timer","🎯 Daily Goals","📈 Study Analytics",
         "📅 Smart Schedule","🔁 Mistake Review",
-        "🏆 Achievements","📝 Personal Notes","⭐ Important Questions"
+        "🏆 Achievements","📝 Personal Notes","⭐ Important Questions",
+        "🎯 Weak & Strong Topics","🎓 Exam Countdown","🎤 Voice Viva"
     ]
 
 # SESSION STATE
@@ -2954,12 +3407,47 @@ def try_auto_login():
         email = json.loads(f.read_text(encoding="utf-8")).get("email", "")
         accounts = load_accounts()
         if email in accounts:
-            st.session_state.logged_in = True
-            st.session_state.user = accounts[email].get("name", email.split("@")[0])
+            reset_session_for_new_user(email, accounts[email].get("name", email.split("@")[0]))
         else:
             clear_remembered_login()
     except Exception:
         pass
+
+
+_PER_USER_SESSION_KEYS = [
+    "pdf_text", "pdf_name", "pdf_pages", "pdf_sig", "pdf_summary",
+    "pdf_quiz", "quiz_id", "quiz_source", "quiz_answers", "quiz_submitted", "quiz_score", "quiz_celebrate",
+    "last_pdf_quiz_name", "important_questions", "important_offset", "important_source",
+    "sessions", "completed_days", "chat_history", "subjects",
+    "mistake_review", "achievements", "notes", "ai_mode",
+    "smart_schedule", "daily_goal_minutes", "pomodoro_count", "pomodoro_minutes",
+    "viva_pool", "viva_idx",
+]
+
+
+def reset_session_for_new_user(email, name):
+    """Log a user in AND wipe any other user's data left over in this browser tab.
+
+    Streamlit keeps st.session_state across a normal page re-run - it has no
+    idea the person who just logged in is not the same person as before. Without
+    this, User B could briefly see User A's PDF, notes, streak or quiz results
+    if they log in on the same tab right after User A logs out.
+
+    Defaults are put back IMMEDIATELY (not left for the next re-run) because
+    this same script execution goes straight on to draw the dashboard.
+    """
+    for key in _PER_USER_SESSION_KEYS:
+        st.session_state.pop(key, None)
+    st.session_state.logged_in = True
+    st.session_state.user = name
+    st.session_state.user_email = email
+    st.session_state._manual_logout = False
+
+    st.session_state.subjects = ["Organic Chemistry", "US History", "Python"]
+    st.session_state.sessions = []
+    st.session_state.chat_history = []
+    st.session_state.completed_days = load_streak_data()
+    init_feature_state()
 
 def login_page():
     """Reference-style torn-paper login page."""
@@ -3250,9 +3738,7 @@ def login_page():
             elif accounts[email].get("password") != password_hash(password):
                 st.warning("⚠️ Wrong password. Click 'forgotten password?' to reset it.")
             else:
-                st.session_state.logged_in = True
-                st.session_state.user = accounts[email].get("name", email.split("@")[0])
-                st.session_state._manual_logout = False
+                reset_session_for_new_user(email, accounts[email].get("name", email.split("@")[0]))
                 if keep_logged_in:
                     remember_login(email)
                 st.rerun()
@@ -3388,9 +3874,7 @@ def login_page():
                         "recovery_answer": answer_hash(rec_answer)
                     }
                     save_accounts(accounts)
-                    st.session_state.logged_in = True
-                    st.session_state.user = name.strip()
-                    st.session_state._manual_logout = False
+                    reset_session_for_new_user(email_clean, name.strip())
                     remember_login(email_clean)
                     st.rerun()
 
@@ -3409,12 +3893,14 @@ def login_page():
 # STUDY STREAK DATA
 # ============================================================
 
-STREAK_FILE = "study_streak.json"
+def _streak_file():
+    return f"study_streak__{_safe_user_slug()}.json"
 
 
 def load_streak_data():
-    """Load saved study dates."""
+    """Load saved study dates for THIS user."""
     try:
+        STREAK_FILE = _streak_file()
         if os.path.exists(STREAK_FILE):
             with open(STREAK_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -3436,7 +3922,7 @@ def load_streak_data():
 
 
 def save_streak_data():
-    """Save study dates permanently."""
+    """Save study dates permanently, per user."""
     try:
         data = {
             "completed_days": [
@@ -3445,7 +3931,7 @@ def save_streak_data():
             ]
         }
 
-        with open(STREAK_FILE, "w", encoding="utf-8") as f:
+        with open(_streak_file(), "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
     except Exception:
         pass
@@ -3625,6 +4111,7 @@ def app_sidebar():
 
             st.session_state.logged_in = False
             st.session_state.user = ""
+            st.session_state.user_email = ""
             st.session_state._manual_logout = True
             st.session_state.show_register = False
             clear_remembered_login()
@@ -4320,6 +4807,7 @@ def study_planner():
                 answered = sum(1 for i in range(len(quiz)) if st.session_state.quiz_answers.get(i))
                 st.caption(f"Answered {answered} of {len(quiz)} questions")
                 if st.button("✅ Submit Quiz", use_container_width=True):
+                    record_quiz_results(quiz, st.session_state.quiz_answers, st.session_state.pdf_name or "")
                     score = 0
                     for i, q in enumerate(quiz):
                         selected = st.session_state.quiz_answers.get(i)
@@ -4448,6 +4936,28 @@ def study_planner():
                         st.markdown("**📝 Answer:** " + _md_safe(item.get("answer", "")))
                         if item.get("section"):
                             st.caption(f"📍 From section: {item['section']}")
+
+
+    # ========================================================
+    # WEAK & STRONG TOPICS
+    elif page == "🎯 Weak & Strong Topics":
+        html("""<div class="page-title">🎯 Weak & Strong Topics</div>
+        <div class="page-subtitle">See which topics you know well and which need more revision</div>""")
+        render_topic_strength()
+
+    # ========================================================
+    # EXAM COUNTDOWN
+    elif page == "🎓 Exam Countdown":
+        html("""<div class="page-title">🎓 Exam Countdown</div>
+        <div class="page-subtitle">Days left, your readiness score and what to study today</div>""")
+        render_exam_countdown()
+
+    # ========================================================
+    # VOICE VIVA
+    elif page == "🎤 Voice Viva":
+        html("""<div class="page-title">🎤 Voice Viva</div>
+        <div class="page-subtitle">An oral quiz from your PDF — listen, answer by voice, get graded</div>""")
+        render_voice_viva()
 
 
 # ============================================================
